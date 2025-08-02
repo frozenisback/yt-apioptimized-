@@ -40,8 +40,10 @@ def resolve_fastest_cdn(original_url):
             r = requests.head(url, timeout=2)
             if r.status_code == 200:
                 return (time.time() - start, url)
-        except:
-            pass
+            else:
+                print(f"[HEAD FAILED] URL: {url}, Status: {r.status_code}")
+        except Exception as e:
+            print(f"[HEAD EXCEPTION] URL: {url}, Error: {str(e)}")
         return (float("inf"), url)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
@@ -49,6 +51,7 @@ def resolve_fastest_cdn(original_url):
 
     best_time, best_url = min(results, key=lambda x: x[0])
     return best_url
+
 
 
 def download_with_progress(url, output_path, num_workers=4):
