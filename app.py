@@ -57,13 +57,21 @@ def download_with_progress(url, output_path, num_workers=4):
         "Connection": "keep-alive"
     }
 
-    r = requests.get(url, headers={**headers, "Range": "bytes=0-0"}, stream=True)
-    if r.status_code not in (200, 206):
-        raise Exception("Failed to get headers from URL")
-
-    total_size = int(r.headers.get('content-range', 'bytes 0-0/0').split('/')[-1])
-    if total_size == 0:
-        raise Exception("Couldn't determine file size.")
+    # Try HEAD request for content length, fallback to GET if not supported
+    try:
+        head = requests.head(url, headers=headers, timeout=5)
+        if 'content-length' in head.headers:
+            total_size = int(head.headers['content-length'])
+        elif head.status_code in (200, 206) and 'content-range' in head.headers:
+            total_size = int(head.headers['content-range'].split('/')[-1])
+        else:
+            raise Exception
+    except:
+        # Fallback to GET without range
+        r0 = requests.get(url, headers=headers, stream=True, timeout=10)
+        total_size = int(r0.headers.get('content-length', 0))
+        if total_size == 0:
+            raise Exception("Couldn't determine file size.")
 
     filename = os.path.basename(urlparse(url).path)
     ext = get_file_extension(url)
@@ -131,7 +139,7 @@ def download():
 
     resolved_url = resolve_fastest_cdn(direct_link)
     print(f"🚀 Using CDN: {resolved_url}")
-    print(f"💾 Downloading to temp dir...")
+    print("💾 Downloading to temp dir...")
 
     temp_dir = tempfile.mkdtemp()
     try:
@@ -147,4 +155,5 @@ def download():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=8000)
+    app.run(debug=True, port=8000)  # Port unchanged
+
