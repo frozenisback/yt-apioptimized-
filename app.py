@@ -1,309 +1,300 @@
-from flask import Flask, request, jsonify, send_file
-import yt_dlp
 import os
-import uuid
+import time
 import requests
-import hashlib
-import glob
-import shutil
+from tqdm import tqdm
+from flask import Flask, request, send_file, jsonify
+from urllib.parse import urlparse
+import concurrent.futures
+import tempfile
 
 app = Flask(__name__)
 
-# Base directory using /tmp (Render free plan uses ephemeral storage)
-BASE_TEMP_DIR = "/tmp"
+API_ENDPOINT = "https://kustbots.frozenbotsweb.workers.dev/?url={url}&type=audio"
 
-# Directory for storing temporary download files (will be cleared after each request)
-TEMP_DOWNLOAD_DIR = os.path.join(BASE_TEMP_DIR, "download")
-os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
 
-# Directory for storing cached audio files (persists until container restart)
-CACHE_DIR = os.path.join(BASE_TEMP_DIR, "cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
+def get_file_extension(url):
+    if "mime=audio%2Fmp4" in url or "mime=audio/mp4" in url:
+        return ".m4a"
+    elif "mime=video%2Fmp4" in url or "mime=video/mp4" in url:
+        return ".mp4"
+    elif "mime=audio%2Fwebm" in url or "mime=audio/webm" in url:
+        return ".webm"
+    return ".bin"
 
-# Directory for storing cached video files separately
-CACHE_VIDEO_DIR = os.path.join(BASE_TEMP_DIR, "cache_video")
-os.makedirs(CACHE_VIDEO_DIR, exist_ok=True)
 
-# Maximum cache size in bytes (adjusted to 500MB for Render free plan)
-MAX_CACHE_SIZE = 500 * 1024 * 1024  # 500MB
+def resolve_fastest_cdn(original_url):
+    parsed = urlparse(original_url)
+    host = parsed.hostname
+    if not host or "googlevideo.com" not in host:
+        return original_url
 
-# Cookie file path: allow override via environment variable COOKIE_FILE_PATH
-# Ensure this is a valid cookies.txt in Netscape format (export from browser)
-COOKIE_FILE_PATH = os.getenv("COOKIE_FILE_PATH", "cookies.txt")
-if COOKIE_FILE_PATH:
-    # If relative path, make absolute under working dir or /tmp
-    COOKIE_FILE_PATH = os.path.abspath(COOKIE_FILE_PATH)
-# Check existence now:
-if COOKIE_FILE_PATH and os.path.isfile(COOKIE_FILE_PATH):
-    app.logger.info(f"Using cookie file at: {COOKIE_FILE_PATH}")
-else:
-    app.logger.warning(f"Cookie file not found or unreadable at: {COOKIE_FILE_PATH}. "
-                       "Continuing without cookies.")
-    COOKIE_FILE_PATH = None  # disable use if not valid
+    base_host = host.split(".googlevideo.com")[0]
+    prefix = base_host.split("---")[0]
+    sn = base_host.split("---")[-1]
+    alt_hosts = [f"{prefix[0:2]}{i}---{sn}.googlevideo.com" for i in range(2, 7)]
+    alt_urls = [original_url.replace(host, h) for h in alt_hosts]
 
-# External Search API URL (used for searching YouTube by title or resolving Spotify links).
-SEARCH_API_URL = "https://odd-block-a945.tenopno.workers.dev/search"
+    def timed_head(url):
+        try:
+            start = time.time()
+            r = requests.head(url, timeout=2)
+            if r.status_code == 200:
+                return (time.time() - start, url)
+        except:
+            pass
+        return (float("inf"), url)
 
-def get_cache_key(video_url: str) -> str:
-    """Generate a cache key from the video URL."""
-    return hashlib.md5(video_url.encode('utf-8')).hexdigest()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        results = list(executor.map(timed_head, alt_urls))
 
-def get_directory_size(directory: str) -> int:
-    total_size = 0
-    for dirpath, dirnames, filenames in os.walk(directory):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            if os.path.isfile(fp):
-                total_size += os.path.getsize(fp)
-    return total_size
+    best_time, best_url = min(results, key=lambda x: x[0])
+    return best_url
 
-def check_cache_size_and_cleanup():
-    total_size = get_directory_size(CACHE_DIR) + get_directory_size(CACHE_VIDEO_DIR)
-    if total_size > MAX_CACHE_SIZE:
-        app.logger.info(f"Cache size {total_size} exceeds {MAX_CACHE_SIZE}, clearing caches.")
-        for cache_dir in [CACHE_DIR, CACHE_VIDEO_DIR]:
-            for file in os.listdir(cache_dir):
-                file_path = os.path.join(cache_dir, file)
-                try:
-                    os.remove(file_path)
-                except Exception as e:
-                    app.logger.warning(f"Error deleting cache file {file_path}: {e}")
 
-def resolve_spotify_link(url: str) -> str:
-    """
-    If the URL is a Spotify link, use the search API to find the corresponding YouTube link.
-    Otherwise, return the URL unchanged.
-    """
-    if "spotify.com" in url:
-        params = {"title": url}
-        resp = requests.get(SEARCH_API_URL, params=params, timeout=15)
-        if resp.status_code != 200:
-            raise Exception("Failed to fetch search results for the Spotify link")
-        search_result = resp.json()
-        if not search_result or 'link' not in search_result:
-            raise Exception("No YouTube link found for the given Spotify link")
-        return search_result['link']
-    return url
-
-def make_ydl_opts_audio(output_template: str):
-    """
-    Build optimized yt-dlp options for lightweight audio-only download with no post-processing.
-    """
-    ffmpeg_path = os.getenv("FFMPEG_PATH", "/usr/bin/ffmpeg")
-    
-    opts = {
-        'format': 'worstaudio',
-        'outtmpl': output_template,
-        'noplaylist': True,
-        'quiet': True,
-        'socket_timeout': 60,
-        'ffmpeg_location': ffmpeg_path,
-        'nocheckcertificate': True,
-        'forceipv4': True,
-        'no_warnings': True,
-        'postprocessors': [],  # disables all post-processing
-        'writesubtitles': False,
-        'writeautomaticsub': False,
-        'writethumbnail': False,
-        'writeinfojson': False,
-        'extractor_args': {'youtube': ['player_client=web']},  # speeds up extraction
+def download_with_progress(url, output_path, num_workers=4):
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Connection": "keep-alive"
     }
 
-    if COOKIE_FILE_PATH:
-        opts['cookiefile'] = COOKIE_FILE_PATH
+    r = requests.get(url, headers={**headers, "Range": "bytes=0-0"}, stream=True)
+    if r.status_code not in (200, 206):
+        raise Exception("Failed to get headers from URL")
 
-    return opts
+    total_size = int(r.headers.get('content-range', 'bytes 0-0/0').split('/')[-1])
+    if total_size == 0:
+        raise Exception("Couldn't determine file size.")
 
-def make_ydl_opts_video(output_template: str):
-    """
-    Build yt-dlp options for video+audio download, <=240p video + worst audio.
-    """
-    ffmpeg_path = os.getenv("FFMPEG_PATH", "/usr/bin/ffmpeg")
-    opts = {
-        'format': 'worstvideo[height<=240]+worstaudio',
-        'merge_output_format': 'mp4',
-        'outtmpl': output_template,
-        'noplaylist': True,
-        'quiet': True,
-        'socket_timeout': 60,
-        'ffmpeg_location': ffmpeg_path,
+    filename = os.path.basename(urlparse(url).path)
+    ext = get_file_extension(url)
+    full_path = os.path.join(output_path, filename + ext)
+
+    with open(full_path, 'wb') as f:
+        f.truncate(total_size)
+
+    def download_range(start, end, index):
+        part_headers = headers.copy()
+        part_headers['Range'] = f"bytes={start}-{end}"
+        try:
+            res = requests.get(url, headers=part_headers, stream=True)
+            with open(full_path, 'r+b') as f:
+                f.seek(start)
+                for chunk in res.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        progress_bars[index].update(len(chunk))
+        except Exception as e:
+            print(f"❌ Thread {index} failed: {e}")
+
+    part_size = total_size // num_workers
+    ranges = [(i * part_size, total_size - 1 if i == num_workers - 1 else ((i + 1) * part_size - 1)) for i in range(num_workers)]
+
+    global progress_bars
+    progress_bars = [tqdm(
+        desc=f"Thread {i+1}",
+        total=(r[1] - r[0] + 1),
+        unit='B',
+        unit_scale=True,
+        unit_divisor=1024,
+        ncols=80,
+        position=i
+    ) for i, r in enumerate(ranges)]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(download_range, start, end, idx) for idx, (start, end) in enumerate(ranges)]
+        concurrent.futures.wait(futures)
+
+    return full_path
+
+
+def fetch_direct_link(video_url):
+    print("🔍 Fetching direct CDN link...")
+    try:
+        r = requests.get(API_ENDPOINT.format(url=video_url), timeout=10)
+        data = r.json()
+        if r.status_code == 200 and "response" in data and "direct_link" in data["response"]:
+            return data["response"]["direct_link"]
+    except Exception as e:
+        print(f"❌ API Error: {e}")
+    return None
+
+
+@app.route('/down')
+def download():
+    input_url = request.args.get("url", "").strip()
+    if not input_url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    direct_link = fetch_direct_link(input_url)
+    if not direct_link:
+        return jsonify({"error": "Invalid or missing CDN link"}), 500
+
+    resolved_url = resolve_fastest_cdn(direct_link)
+    print(f"🚀 Using CDN: {resolved_url}")
+    print(f"💾 Downloading to temp dir...")
+
+    temp_dir = tempfile.mkdtemp()
+    try:
+        start_time = time.time()
+        file_path = download_with_progress(resolved_url, temp_dir)
+        elapsed = time.time() - start_time
+        print(f"\n✅ Download complete in {elapsed:.2f} seconds")
+        print(f"📍 File location: {file_path}")
+        return send_file(file_path, as_attachment=True)
+    except Exception as e:
+        print(f"❌ Download error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    app.run(debug=True, import os
+import time
+import requests
+from tqdm import tqdm
+from flask import Flask, request, send_file, jsonify
+from urllib.parse import urlparse
+import concurrent.futures
+import tempfile
+
+app = Flask(__name__)
+
+API_ENDPOINT = "https://kustbots.frozenbotsweb.workers.dev/?url={url}&type=audio"
+
+
+def get_file_extension(url):
+    if "mime=audio%2Fmp4" in url or "mime=audio/mp4" in url:
+        return ".m4a"
+    elif "mime=video%2Fmp4" in url or "mime=video/mp4" in url:
+        return ".mp4"
+    elif "mime=audio%2Fwebm" in url or "mime=audio/webm" in url:
+        return ".webm"
+    return ".bin"
+
+
+def resolve_fastest_cdn(original_url):
+    parsed = urlparse(original_url)
+    host = parsed.hostname
+    if not host or "googlevideo.com" not in host:
+        return original_url
+
+    base_host = host.split(".googlevideo.com")[0]
+    prefix = base_host.split("---")[0]
+    sn = base_host.split("---")[-1]
+    alt_hosts = [f"{prefix[0:2]}{i}---{sn}.googlevideo.com" for i in range(2, 7)]
+    alt_urls = [original_url.replace(host, h) for h in alt_hosts]
+
+    def timed_head(url):
+        try:
+            start = time.time()
+            r = requests.head(url, timeout=2)
+            if r.status_code == 200:
+                return (time.time() - start, url)
+        except:
+            pass
+        return (float("inf"), url)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        results = list(executor.map(timed_head, alt_urls))
+
+    best_time, best_url = min(results, key=lambda x: x[0])
+    return best_url
+
+
+def download_with_progress(url, output_path, num_workers=4):
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Connection": "keep-alive"
     }
-    if COOKIE_FILE_PATH:
-        opts['cookiefile'] = COOKIE_FILE_PATH
-    return opts
 
-def download_audio(video_url: str) -> str:
-    cache_key = get_cache_key(video_url)
-    cached_files = glob.glob(os.path.join(CACHE_DIR, f"{cache_key}.*"))
-    if cached_files:
-        return cached_files[0]
+    r = requests.get(url, headers={**headers, "Range": "bytes=0-0"}, stream=True)
+    if r.status_code not in (200, 206):
+        raise Exception("Failed to get headers from URL")
 
-    unique_id = str(uuid.uuid4())
-    output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
-    ydl_opts = make_ydl_opts_audio(output_template)
+    total_size = int(r.headers.get('content-range', 'bytes 0-0/0').split('/')[-1])
+    if total_size == 0:
+        raise Exception("Couldn't determine file size.")
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    filename = os.path.basename(urlparse(url).path)
+    ext = get_file_extension(url)
+    full_path = os.path.join(output_path, filename + ext)
+
+    with open(full_path, 'wb') as f:
+        f.truncate(total_size)
+
+    def download_range(start, end, index):
+        part_headers = headers.copy()
+        part_headers['Range'] = f"bytes={start}-{end}"
         try:
-            info = ydl.extract_info(video_url, download=True)
-            downloaded_file = ydl.prepare_filename(info)
-            # Determine extension
-            ext = info.get("ext", os.path.splitext(downloaded_file)[1].lstrip(".")) or "m4a"
-            cached_file_path = os.path.join(CACHE_DIR, f"{cache_key}.{ext}")
-            # Move to cache
-            shutil.move(downloaded_file, cached_file_path)
-            check_cache_size_and_cleanup()
-            return cached_file_path
+            res = requests.get(url, headers=part_headers, stream=True)
+            with open(full_path, 'r+b') as f:
+                f.seek(start)
+                for chunk in res.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        progress_bars[index].update(len(chunk))
         except Exception as e:
-            app.logger.error(f"Error downloading audio for {video_url}: {e}")
-            raise Exception(f"Error downloading audio: {e}")
+            print(f"❌ Thread {index} failed: {e}")
 
-def download_video(video_url: str) -> str:
-    cache_key = hashlib.md5((video_url + "_video").encode('utf-8')).hexdigest()
-    cached_files = glob.glob(os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.*"))
-    if cached_files:
-        return cached_files[0]
+    part_size = total_size // num_workers
+    ranges = [(i * part_size, total_size - 1 if i == num_workers - 1 else ((i + 1) * part_size - 1)) for i in range(num_workers)]
 
-    unique_id = str(uuid.uuid4())
-    output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
-    ydl_opts = make_ydl_opts_video(output_template)
+    global progress_bars
+    progress_bars = [tqdm(
+        desc=f"Thread {i+1}",
+        total=(r[1] - r[0] + 1),
+        unit='B',
+        unit_scale=True,
+        unit_divisor=1024,
+        ncols=80,
+        position=i
+    ) for i, r in enumerate(ranges)]
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(video_url, download=True)
-            downloaded_file = ydl.prepare_filename(info)
-            cached_file_path = os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.mp4")
-            # Move/rename to ensure .mp4
-            if os.path.abspath(downloaded_file) != os.path.abspath(cached_file_path):
-                shutil.move(downloaded_file, cached_file_path)
-            check_cache_size_and_cleanup()
-            return cached_file_path
-        except Exception as e:
-            app.logger.error(f"Error downloading video for {video_url}: {e}")
-            raise Exception(f"Error downloading video: {e}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(download_range, start, end, idx) for idx, (start, end) in enumerate(ranges)]
+        concurrent.futures.wait(futures)
 
-@app.route('/search', methods=['GET'])
-def search_video():
+    return full_path
+
+
+def fetch_direct_link(video_url):
+    print("🔍 Fetching direct CDN link...")
     try:
-        query = request.args.get('title')
-        if not query:
-            return jsonify({"error": "The 'title' parameter is required"}), 400
-        resp = requests.get(SEARCH_API_URL, params={"title": query}, timeout=15)
-        if resp.status_code != 200:
-            app.logger.error(f"Search API returned {resp.status_code} for query {query}")
-            return jsonify({"error": "Failed to fetch search results"}), 500
-        search_result = resp.json()
-        if not search_result or 'link' not in search_result:
-            return jsonify({"error": "No videos found for the given query"}), 404
-        return jsonify({
-            "title": search_result.get("title"),
-            "url": search_result["link"],
-            "duration": search_result.get("duration"),
-        })
+        r = requests.get(API_ENDPOINT.format(url=video_url), timeout=10)
+        data = r.json()
+        if r.status_code == 200 and "response" in data and "direct_link" in data["response"]:
+            return data["response"]["direct_link"]
     except Exception as e:
-        app.logger.error(f"Exception in /search: {e}")
+        print(f"❌ API Error: {e}")
+    return None
+
+
+@app.route('/down')
+def download():
+    input_url = request.args.get("url", "").strip()
+    if not input_url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    direct_link = fetch_direct_link(input_url)
+    if not direct_link:
+        return jsonify({"error": "Invalid or missing CDN link"}), 500
+
+    resolved_url = resolve_fastest_cdn(direct_link)
+    print(f"🚀 Using CDN: {resolved_url}")
+    print(f"💾 Downloading to temp dir...")
+
+    temp_dir = tempfile.mkdtemp()
+    try:
+        start_time = time.time()
+        file_path = download_with_progress(resolved_url, temp_dir)
+        elapsed = time.time() - start_time
+        print(f"\n✅ Download complete in {elapsed:.2f} seconds")
+        print(f"📍 File location: {file_path}")
+        return send_file(file_path, as_attachment=True)
+    except Exception as e:
+        print(f"❌ Download error: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/vdown', methods=['GET'])
-def download_video_endpoint():
-    try:
-        video_url = request.args.get('url')
-        video_title = request.args.get('title')
-        if not video_url and not video_title:
-            return jsonify({"error": "Either 'url' or 'title' parameter is required"}), 400
-        if video_title and not video_url:
-            resp = requests.get(SEARCH_API_URL, params={"title": video_title}, timeout=15)
-            if resp.status_code != 200:
-                app.logger.error(f"Search API error for title {video_title}: {resp.status_code}")
-                return jsonify({"error": "Failed to fetch search results"}), 500
-            search_result = resp.json()
-            if not search_result or 'link' not in search_result:
-                return jsonify({"error": "No videos found for the given query"}), 404
-            video_url = search_result['link']
-        if video_url and "spotify.com" in video_url:
-            video_url = resolve_spotify_link(video_url)
-        cached_file_path = download_video(video_url)
-        return send_file(
-            cached_file_path,
-            as_attachment=True,
-            download_name=os.path.basename(cached_file_path)
-        )
-    except Exception as e:
-        app.logger.error(f"Exception in /vdown: {e}")
-        return jsonify({"error": str(e)}), 500
-    finally:
-        # Clean up temporary download files only (not the caches)
-        for file in os.listdir(TEMP_DOWNLOAD_DIR):
-            file_path = os.path.join(TEMP_DOWNLOAD_DIR, file)
-            try:
-                os.remove(file_path)
-            except Exception as cleanup_error:
-                app.logger.warning(f"Error deleting temp file {file_path}: {cleanup_error}")
 
-@app.route('/download', methods=['GET'])
-def download_audio_endpoint():
-    try:
-        video_url = request.args.get('url')
-        video_title = request.args.get('title')
-        if not video_url and not video_title:
-            return jsonify({"error": "Either 'url' or 'title' parameter is required"}), 400
-        if video_title and not video_url:
-            resp = requests.get(SEARCH_API_URL, params={"title": video_title}, timeout=15)
-            if resp.status_code != 200:
-                app.logger.error(f"Search API error for title {video_title}: {resp.status_code}")
-                return jsonify({"error": "Failed to fetch search results"}), 500
-            search_result = resp.json()
-            if not search_result or 'link' not in search_result:
-                return jsonify({"error": "No videos found for the given query"}), 404
-            video_url = search_result['link']
-        if video_url and "spotify.com" in video_url:
-            video_url = resolve_spotify_link(video_url)
-        cached_file_path = download_audio(video_url)
-        return send_file(
-            cached_file_path,
-            as_attachment=True,
-            download_name=os.path.basename(cached_file_path)
-        )
-    except Exception as e:
-        app.logger.error(f"Exception in /download: {e}")
-        return jsonify({"error": str(e)}), 500
-    finally:
-        for file in os.listdir(TEMP_DOWNLOAD_DIR):
-            file_path = os.path.join(TEMP_DOWNLOAD_DIR, file)
-            try:
-                os.remove(file_path)
-            except Exception as cleanup_error:
-                app.logger.warning(f"Error deleting temp file {file_path}: {cleanup_error}")
-
-@app.route('/')
-def home():
-    return """
-    <h1>🎶 YouTube Audio/Video Downloader API</h1>
-    <p>Use this API to search and download audio or video from YouTube.</p>
-    <p><strong>Endpoints:</strong></p>
-    <ul>
-        <li><strong>/search</strong>: Search for a video by title. Query parameter: <code>?title=</code></li>
-        <li><strong>/download</strong>: Download audio by URL or search by title. Query parameters: <code>?url=</code> or <code>?title=</code></li>
-        <li><strong>/vdown</strong>: Download video (≤240p + worst audio) by URL or search by title. Query parameters: <code>?url=</code> or <code>?title=</code></li>
-    </ul>
-    <p>Examples:</p>
-    <ul>
-        <li>Search: <code>/search?title=Your%20Favorite%20Song</code></li>
-        <li>Download by URL (audio): <code>/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ</code></li>
-        <li>Download by Title (audio): <code>/download?title=Your%20Favorite%20Song</code></li>
-        <li>Download by URL (video): <code>/vdown?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ</code></li>
-        <li>Download from Spotify: <code>/download?url=https://open.spotify.com/track/...</code></li>
-    </ul>
-    """
-
-if __name__ == '__main__':
-    # For local testing
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
-
-
-
-
-
-
-
-
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
 
