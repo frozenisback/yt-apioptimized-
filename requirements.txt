@@ -1,6 +1,7 @@
 Flask==2.3.2
 yt-dlp==2025.6.9
 gunicorn==21.2.0
-flask[async]
-requests
+requests==2.31.0
+tqdm==4.66.4
+
 
