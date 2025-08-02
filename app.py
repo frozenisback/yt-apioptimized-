@@ -87,9 +87,10 @@ def resolve_spotify_link(url: str) -> str:
 
 def make_ydl_opts_audio(output_template: str):
     """
-    Build yt-dlp options for audio-only download, including cookiefile if valid.
+    Build optimized yt-dlp options for lightweight audio-only download with no post-processing.
     """
     ffmpeg_path = os.getenv("FFMPEG_PATH", "/usr/bin/ffmpeg")
+    
     opts = {
         'format': 'worstaudio',
         'outtmpl': output_template,
@@ -97,9 +98,20 @@ def make_ydl_opts_audio(output_template: str):
         'quiet': True,
         'socket_timeout': 60,
         'ffmpeg_location': ffmpeg_path,
+        'nocheckcertificate': True,
+        'forceipv4': True,
+        'no_warnings': True,
+        'postprocessors': [],  # disables all post-processing
+        'writesubtitles': False,
+        'writeautomaticsub': False,
+        'writethumbnail': False,
+        'writeinfojson': False,
+        'extractor_args': {'youtube': ['player_client=web']},  # speeds up extraction
     }
+
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
+
     return opts
 
 def make_ydl_opts_video(output_template: str):
